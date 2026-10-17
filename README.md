@@ -154,6 +154,27 @@ cd /opt/mba-garant
 ./scripts/migrate.sh serve     # запустить веб
 ```
 
+### Windows
+
+На Windows — тот же помощник на PowerShell: `scripts\migrate.ps1` (или обёртка
+`scripts\migrate.cmd`). Команды: `check`, `export`, `deploy`, `serve`, `bot`, `doctor`,
+`install-service [-Method Task|Nssm]`.
+
+```powershell
+# упаковать код + состояние в migrate-out\*.zip
+powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 export
+
+# на целевой машине:
+Expand-Archive mba-garant-*.zip -DestinationPath C:\mba-garant
+cd C:\mba-garant
+powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 check
+powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 deploy
+powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 serve
+```
+
+Автозапуск: `install-service` — по умолчанию через Task Scheduler, либо `-Method Nssm`
+(настоящая служба с автостартом). Нужен Node.js 24+ (`winget install OpenJS.NodeJS.LTS`).
+
 ## Безопасность и данные
 
 - `.env`, `whitelist.json`, все `*.db`, медиа и логи **не попадают в git** (см. `.gitignore`).

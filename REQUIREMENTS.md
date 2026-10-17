@@ -6,7 +6,7 @@
 
 | Параметр | Значение |
 |---|---|
-| ОС | Linux x86_64 или arm64 (Debian/Ubuntu — примеры команд ниже) |
+| ОС | Linux x86_64/arm64 (Debian/Ubuntu) или Windows 10/11, Windows Server 2016+ |
 | RAM | от 1 ГБ (с Ollama — ориентируйтесь на модель) |
 | Диск | от 1 ГБ (проект + БД + медиа) |
 | CPU | любой; GPU нужен только для Ollama |
@@ -95,3 +95,25 @@ node -p "process.version"
 node -e "new (require('node:sqlite').Database)(':memory:'); console.log('sqlite OK')"
 tailscale status   # если используется Tailscale
 ```
+
+## 7. Windows (кратко)
+
+Шаги те же; отличия от Linux:
+
+| Задача | Windows |
+|---|---|
+| Node.js 24+ | `winget install OpenJS.NodeJS.LTS` |
+| Скрипты переноса | `scripts\migrate.ps1` (обёртка `scripts\migrate.cmd`), команды те же |
+| Автозапуск | `install-service` — Task Scheduler (по умолчанию) или `-Method Nssm` (служба) вместо systemd |
+| Упаковка/распаковка | встроенные `robocopy` / `Expand-Archive` / `ZipFile` — ставить ничего не нужно |
+| sqlite3 CLI | опционально: `winget install SQLite.SQLite` |
+| Ollama / Tailscale | те же продукты, ставятся через winget или с сайта |
+
+```powershell
+powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 check
+powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 deploy
+powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 install-service
+```
+
+> Пути к медиа в БД хранятся относительно корня проекта, поэтому «источник правды»
+> держите на одной ОС и переносите проект целиком вместе с `bot\storage`.
