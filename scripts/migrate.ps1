@@ -1,17 +1,21 @@
-﻿# migrate.ps1 - перенос и развёртывание MBA-Garant на Windows.
+﻿﻿# migrate.ps1 - перенос и развёртывание MBA-Garant на Windows.
 #
 # Подкоманды:
 #   check            Проверить окружение (Node, node:sqlite, .env, БД)
-#   export           Упаковать КОД + СОСТОЯНИЕ (БД, .env, whitelist, медиа) в migrate-out\*.zip
+#   export [tag]     Упаковать КОД + СОСТОЯНИЕ (БД, .env, whitelist, медиа) в migrate-out\*.zip
+#                    Второй аргумент - метка версии: export zip v2 -> mba-garant-v2-*.zip
 #   deploy           Установить зависимости и собрать (npm ci + npm run build)
 #   serve            Запустить веб-консоль (next start)
 #   bot              Запустить Telegram-бота
 #   doctor           Проверить, что веб отвечает
 #   install-service  Прописать автозапуск: -Method Task (по умолчанию) или -Method Nssm
 #
+# Адрес и порт веб-консоли берутся из .env (WEB_HOST/WEB_PORT). Параметры
+# -BindHost/-Port перекрывают значения из .env.
+#
 # Примеры:
 #   powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 check
-#   powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 export
+#   powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 export zip v2
 #   powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 deploy
 #   powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 serve
 #   powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 bot
@@ -22,9 +26,10 @@ param(
   [Parameter(Position = 0)][string]$Command = 'help',
   [Parameter(Position = 1)][string]$Format = 'zip',
   [ValidateSet('Task', 'Nssm')][string]$Method = 'Task',
-  [string]$BindHost = '127.0.0.1',
-  [int]$Port = 3000,
-  [string]$OutDir
+  [string]$BindHost = '',
+  [int]$Port = 0,
+  [string]$OutDir,
+  [string]$Tag = ''
 )
 
 $ErrorActionPreference = 'Stop'
@@ -40,10 +45,35 @@ function Write-Ok   { param([string]$Message) Write-Host "[ok] $Message" -Foregr
 function Write-Warn2 { param([string]$Message) Write-Host "[!] $Message" -ForegroundColor Yellow }
 function Fail       { param([string]$Message) Write-Host "[x] $Message" -ForegroundColor Red; exit 1 }
 
+# Get-EnvValue KEY [DEFAULT] - значение из .env (последнее вхождение) или DEFAULT.
+function Get-EnvValue {
+  param([string]$Key, [string]$Default = '')
+  $file = Join-Path $script:Root '.env'
+  if (-not (Test-Path -LiteralPath $file)) { return $Default }
+  $pattern = "^\s*$([regex]::Escape($Key))\s*="
+  $line = Get-Content -LiteralPath $file -ErrorAction SilentlyContinue |
+    Where-Object { $_ -match $pattern } | Select-Object -Last 1
+  if (-not $line) { return $Default }
+  $val = ($line -replace $pattern, '').Trim()
+  $val = $val.Trim([char]'"').Trim([char]"'")
+  if ([string]::IsNullOrWhiteSpace($val)) { return $Default }
+  return $val
+}
+
+# Приоритет: параметр > .env > значение по умолчанию
+if (-not $BindHost) { $BindHost = Get-EnvValue 'WEB_HOST' (Get-EnvValue 'HOST' '127.0.0.1') }
+if ($Port -le 0) {
+  $portRaw = Get-EnvValue 'WEB_PORT' (Get-EnvValue 'PORT' '3000')
+  $portNum = 0
+  if ([int]::TryParse($portRaw, [ref]$portNum) -and $portNum -gt 0) { $Port = $portNum }
+  else { Write-Warn2 "Некорректный порт в .env ('$portRaw') - использую 3000"; $Port = 3000 }
+}
+
 function Show-Usage {
-  Get-Content -LiteralPath $PSCommandPath |
-    Select-Object -Skip 1 -First 21 |
-    ForEach-Object { $_ -replace '^#\s?', '' }
+  foreach ($line in (Get-Content -LiteralPath $PSCommandPath)) {
+    if ($line -notmatch '^\s*#') { break }
+    ($line -replace '^#\s?', '')
+  }
 }
 
 # ------------------------------- хелперы -------------------------------
@@ -145,6 +175,8 @@ function Invoke-Check {
   if (Test-Path -LiteralPath (Join-Path $script:Root 'bot\storage')) { Write-Ok 'bot\storage на месте' }
   else { Write-Warn2 'bot\storage отсутствует - медиафайлы не найдутся' }
 
+  Write-Ok "Веб-консоль: http://${BindHost}:${Port}"
+
   if (Get-Command tailscale -ErrorAction SilentlyContinue) {
     Write-Ok 'tailscale найден (проверьте: tailscale status)'
   } else {
@@ -155,11 +187,13 @@ function Invoke-Check {
 # ------------------------------- export -------------------------------
 function Invoke-Export {
   param([string]$Fmt = 'zip')
-  if ($Fmt -ne 'zip') { Write-Warn2 "На Windows поддерживается только zip - использую zip." }
+  if ($Fmt -ne 'zip') { Write-Warn2 'На Windows поддерживается только zip - использую zip.' }
   $null = Assert-Node
 
   $stamp = Get-Date -Format 'yyyy-MM-dd-HHmmss'
-  $name = "mba-garant-$stamp"
+  $suffix = ''
+  if ($Tag) { $suffix = "-$Tag" }
+  $name = "mba-garant$suffix-$stamp"
   if (-not (Test-Path -LiteralPath $OutDir)) {
     New-Item -ItemType Directory -Force -Path $OutDir | Out-Null
   }
@@ -263,7 +297,7 @@ function Invoke-InstallService {
     if (-not (Get-Command nssm -ErrorAction SilentlyContinue)) {
       Fail 'nssm не найден. Установите: winget install nssm'
     }
-    & nssm install 'MBA-Garant-Web' $node "$nextBin start -H 127.0.0.1 -p $Port"
+    & nssm install 'MBA-Garant-Web' $node "$nextBin start -H $BindHost -p $Port"
     & nssm set 'MBA-Garant-Web' AppDirectory $script:Root
     & nssm set 'MBA-Garant-Web' Start SERVICE_AUTO_START
     & nssm install 'MBA-Garant-Bot' $node "$tsxBin $botEntry"
@@ -275,7 +309,7 @@ function Invoke-InstallService {
   }
 
   # Task Scheduler
-  $webArgs = "`"$nextBin`" start -H 127.0.0.1 -p $Port"
+  $webArgs = "`"$nextBin`" start -H $BindHost -p $Port"
   $botArgs = "`"$tsxBin`" `"$botEntry`""
 
   try {
@@ -292,7 +326,7 @@ function Invoke-InstallService {
     Fail "Не удалось создать задачи. Запустите PowerShell от имени администратора. Детали: $($_.Exception.Message)"
   }
 
-  Write-Ok 'Задачи созданы (автозапуск при входе пользователя).'
+  Write-Ok "Задачи созданы (автозапуск при входе; http://${BindHost}:${Port})."
   Write-Host "Запустить сейчас:   Start-ScheduledTask -TaskName 'MBA-Garant Web'"
   Write-Host "Остановить:         Stop-ScheduledTask  -TaskName 'MBA-Garant Web'"
   Write-Host 'Полноценную службу без окна консоли даёт: install-service -Method Nssm'

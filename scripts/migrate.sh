@@ -4,12 +4,15 @@
 #
 # Подкоманды:
 #   check            Проверить окружение (Node, node:sqlite, .env, БД)
-#   export [zip|tar] Упаковать КОД + СОСТОЯНИЕ (БД, .env, whitelist, медиа) в архив
+#   export [zip|tar] [tag]  Упаковать КОД + СОСТОЯНИЕ (БД, .env, whitelist, медиа); tag → mba-garant-<tag>-*
 #   deploy           Установить зависимости и собрать (npm ci + npm run build)
 #   serve            Запустить веб-консоль (next start)
 #   bot              Запустить Telegram-бота
 #   install-service  Сгенерировать systemd-юниты (нужен root)
 #   doctor           Быстрая проверка, что веб и БД отвечают
+#
+# Адрес и порт веб-консоли берутся из .env (WEB_HOST/WEB_PORT). Переменные
+# окружения WEB_HOST/WEB_PORT перекрывают значения из .env.
 #
 set -euo pipefail
 
@@ -17,8 +20,23 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
 
 MIN_NODE_MAJOR=24
-WEB_HOST="${WEB_HOST:-127.0.0.1}"
-WEB_PORT="${WEB_PORT:-3000}"
+
+# read_env KEY [DEFAULT] — значение из .env (последнее вхождение) или DEFAULT.
+read_env() {
+  local key="$1" def="${2:-}" line
+  [ -f "$ROOT/.env" ] || { printf '%s' "$def"; return; }
+  line="$(grep -E "^[[:space:]]*${key}[[:space:]]*=" "$ROOT/.env" 2>/dev/null | tail -n1 || true)"
+  line="${line#*=}"                                       # всё после первого '='
+  line="${line%$'\r'}"                                    # снять CR (если .env в CRLF)
+  line="${line#"${line%%[![:space:]]*}"}"                 # ltrim
+  line="${line%"${line##*[![:space:]]}"}"                 # rtrim
+  line="${line#\"}"; line="${line%\"}"; line="${line#\'}"; line="${line%\'}"
+  printf '%s' "${line:-$def}"
+}
+
+# Приоритет: переменная окружения > .env > значение по умолчанию
+WEB_HOST="${WEB_HOST:-$(read_env WEB_HOST "$(read_env HOST '127.0.0.1')")}"
+WEB_PORT="${WEB_PORT:-$(read_env WEB_PORT "$(read_env PORT '3000')")}"
 OUT_DIR="${OUT_DIR:-$ROOT/migrate-out}"
 
 # ---------- вывод ----------
@@ -29,7 +47,7 @@ warn() { printf '%s[!]%s %s\n'  "$c_yellow" "$c_reset" "$*" >&2; }
 die()  { printf '%s[x]%s %s\n'  "$c_red"    "$c_reset" "$*" >&2; exit 1; }
 
 usage() {
-  sed -n '3,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+  awk 'NR==1{next} /^#/{sub(/^# ?/,""); print; next} {exit}' "${BASH_SOURCE[0]}"
   exit 0
 }
 
@@ -87,6 +105,8 @@ cmd_check() {
 
   [ -d bot/storage ] && ok "bot/storage на месте" || warn "bot/storage отсутствует — медиафайлы не найдутся"
 
+  ok "Веб-консоль: http://$WEB_HOST:$WEB_PORT"
+
   if command -v tailscale >/dev/null 2>&1; then
     tailscale status >/dev/null 2>&1 && ok "Tailscale подключён" || warn "Tailscale установлен, но не подключён (tailscale up)"
   else
@@ -97,10 +117,12 @@ cmd_check() {
 # ---------- export ----------
 cmd_export() {
   local fmt="${1:-tar}"
+  local tag="${2:-}"
   need_node
-  local stamp dir
+  local stamp name dir
   stamp="$(date +%F-%H%M%S)"
-  dir="$OUT_DIR/mba-garant-$stamp"
+  name="mba-garant${tag:+-$tag}-$stamp"
+  dir="$OUT_DIR/$name"
 
   log "Собираю пакет переноса в $dir"
   mkdir -p "$dir"
@@ -135,11 +157,11 @@ cmd_export() {
   local archive
   if [ "$fmt" = "zip" ]; then
     command -v zip >/dev/null 2>&1 || die "zip не установлен"
-    archive="$OUT_DIR/mba-garant-$stamp.zip"
-    ( cd "$OUT_DIR" && zip -qr "$archive" "mba-garant-$stamp" )
+    archive="$OUT_DIR/$name.zip"
+    ( cd "$OUT_DIR" && zip -qr "$archive" "$name" )
   else
-    archive="$OUT_DIR/mba-garant-$stamp.tar.gz"
-    tar czf "$archive" -C "$OUT_DIR" "mba-garant-$stamp"
+    archive="$OUT_DIR/$name.tar.gz"
+    tar czf "$archive" -C "$OUT_DIR" "$name"
   fi
   rm -rf "$dir"
 
@@ -195,7 +217,7 @@ cmd_install_service() {
   command -v systemctl >/dev/null 2>&1 || die "systemd не найден"
   local node_bin; node_bin="$(command -v node)"
 
-  log "Создаю systemd-юниты (WorkingDirectory=$ROOT)"
+  log "Создаю systemd-юниты (WorkingDirectory=$ROOT, порт $WEB_PORT)"
   cat > /etc/systemd/system/mba-web.service <<EOF
 [Unit]
 Description=MBA-Garant web console
@@ -204,7 +226,7 @@ After=network-online.target
 [Service]
 WorkingDirectory=$ROOT
 EnvironmentFile=$ROOT/.env
-ExecStart=$node_bin $ROOT/node_modules/.bin/next start -H 127.0.0.1 -p $WEB_PORT
+ExecStart=$node_bin $ROOT/node_modules/.bin/next start -H $WEB_HOST -p $WEB_PORT
 Restart=always
 RestartSec=3
 
@@ -237,7 +259,7 @@ EOF
 # ---------- диспетчер ----------
 case "${1:-}" in
   check)            cmd_check ;;
-  export)           shift; cmd_export "${1:-tar}" ;;
+  export)           shift; cmd_export "${1:-tar}" "${2:-}" ;;
   deploy)           cmd_deploy ;;
   serve)            cmd_serve ;;
   bot)              cmd_bot ;;

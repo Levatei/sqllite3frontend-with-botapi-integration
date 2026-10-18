@@ -72,6 +72,7 @@ nvm install 24
 | `ORDER_STATUS` | статус новых заявок (по умолчанию `Новая Заявка`) |
 | `MEDIA_DIR` | папка медиа (по умолчанию `bot/storage/media`) |
 | `WHITELIST_FILE` | файл доступа бота (по умолчанию `whitelist.json`) |
+| `WEB_HOST` / `WEB_PORT` | адрес и порт веб-консоли (по умолчанию `127.0.0.1` / `3000`); читаются скриптами миграции |
 
 Пример для Ollama на другой машине в tailnet:
 
@@ -85,7 +86,7 @@ OLLAMA_URL=http://127.0.0.1:11434,http://100.x.y.z:11434
 
 | Порт | Назначение | Доступ |
 |---|---|---|
-| 3000 | веб-консоль (`next start`) | только loopback + `tailscale serve` |
+| 3000 (`WEB_PORT`) | веб-консоль (`next start`) | только loopback + `tailscale serve` |
 | 11434 | Ollama | только внутри tailnet |
 
 Проверка после установки:

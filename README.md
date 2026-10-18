@@ -121,7 +121,7 @@ npm run bot              # или npm run bot:dev — с авто-перезап
 ```bash
 npm ci
 npm run build
-npx next start -H 127.0.0.1 -p 3000
+npx next start -H 127.0.0.1 -p 3000   # адрес/порт можно задать в .env: WEB_HOST/WEB_PORT
 tailscale serve --bg 3000        # HTTPS без домена, доступ только из tailnet
 ```
 
@@ -174,6 +174,13 @@ powershell -ExecutionPolicy Bypass -File scripts\migrate.ps1 serve
 
 Автозапуск: `install-service` — по умолчанию через Task Scheduler, либо `-Method Nssm`
 (настоящая служба с автостартом). Нужен Node.js 24+ (`winget install OpenJS.NodeJS.LTS`).
+
+### Порт веб-консоли
+
+Адрес и порт задаются в `.env` (`WEB_HOST` / `WEB_PORT`, по умолчанию `127.0.0.1:3000`)
+и читаются обоими скриптами переноса. Если порт занят другим приложением — поменяйте
+`WEB_PORT`. На Windows порт «зашивается» в задачу планировщика, поэтому после смены порта
+перезапустите `install-service`. Разовая проверка занятости порта: `netstat -ano | findstr :3000`.
 
 ## Безопасность и данные
 
