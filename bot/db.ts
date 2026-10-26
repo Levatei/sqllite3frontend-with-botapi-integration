@@ -1,10 +1,13 @@
 import {
   ensureMediaTable,
   genericInsert,
+  genericUpdate,
   getDb,
   insertMedia,
+  listMedia,
   listRows,
   tableExists,
+  type MediaRecord,
 } from '../lib/db';
 import { absoluteMediaPath, isInsideAllowedRoots } from '../lib/media-store';
 import { config } from './config';
@@ -38,6 +41,99 @@ export function getOrderById(id: number): Row | undefined {
     pageSize: 1,
   });
   return rows[0];
+}
+
+export interface OrderDetails {
+  order_id: number;
+  client_id: number | null;
+  equipment_id: number | null;
+  status: string | null;
+  creation_date: string | null;
+  client_name: string | null;
+  client_number: string | null;
+  client_mail: string | null;
+  manufacturer: string | null;
+  model: string | null;
+  serial_number: string | null;
+  comments: string | null;
+  diagnostic_results: string | null;
+  price: string | number | null;
+}
+
+function queryOrderRows(where: string, params: unknown[]): OrderDetails[] {
+  const db = getDb();
+  if (!tableExists('orders', db)) return [];
+  const hasEquipment = tableExists('equipment', db);
+  const hasClients = tableExists('clients', db);
+  const equipmentJoin = hasEquipment
+    ? 'LEFT JOIN "equipment" e ON e."equipment_id" = o."equipment_id"'
+    : '';
+  const clientsJoin = hasClients
+    ? 'LEFT JOIN "clients" c ON c."client_id" = o."client_id"'
+    : '';
+  const columns = [
+    'o."order_id" AS order_id',
+    'o."client_id" AS client_id',
+    'o."equipment_id" AS equipment_id',
+    'o."status" AS status',
+    'o."creation_date" AS creation_date',
+    'o."comments" AS comments',
+    'o."diagnostic_results" AS diagnostic_results',
+    'o."price" AS price',
+    hasClients ? 'c."name" AS client_name' : 'NULL AS client_name',
+    hasClients ? 'c."number" AS client_number' : 'NULL AS client_number',
+    hasClients ? 'c."mail" AS client_mail' : 'NULL AS client_mail',
+    hasEquipment ? 'e."manufacturer" AS manufacturer' : 'NULL AS manufacturer',
+    hasEquipment ? 'e."model" AS model' : 'NULL AS model',
+    hasEquipment ? 'e."serial_number" AS serial_number' : 'NULL AS serial_number',
+  ].join(', ');
+  const rows = db
+    .prepare(`SELECT ${columns} FROM "orders" o ${equipmentJoin} ${clientsJoin} ${where}`)
+    .all(...params);
+  return rows as unknown as OrderDetails[];
+}
+
+/** Заявка вместе с клиентом и оборудованием — для карточки в боте. */
+export function getOrderDetails(orderId: number): OrderDetails | undefined {
+  try {
+    return queryOrderRows('WHERE o."order_id" = ? LIMIT 1', [orderId])[0];
+  } catch {
+    return undefined;
+  }
+}
+
+/** Актуальные заявки: все, кроме закрытых («Выдано»), сначала новые. */
+export function listActiveOrders(): OrderDetails[] {
+  try {
+    return queryOrderRows(
+      `WHERE TRIM(COALESCE(o."status", '')) <> 'Выдано'
+        ORDER BY o."creation_date" DESC, o."order_id" DESC`,
+      []
+    );
+  } catch {
+    return [];
+  }
+}
+
+/** Записать результат диагностики в заявку. */
+export function updateOrderDiagnostics(orderId: number, text: string): boolean {
+  try {
+    const db = getDb();
+    if (!tableExists('orders', db)) return false;
+    const row = db
+      .prepare('SELECT rowid AS rid FROM "orders" WHERE "order_id" = ? LIMIT 1')
+      .get(orderId) as unknown as { rid: number } | undefined;
+    if (!row) return false;
+    genericUpdate('orders', Number(row.rid), { diagnostic_results: text });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+/** Все медиафайлы заявки (включая фото шильдика и загрузки из веба). */
+export function listOrderMedia(orderId: number): MediaRecord[] {
+  return listMedia({ order_id: orderId, limit: 1000 });
 }
 
 export function insertClient(data: { name: string; number?: string; mail?: string }): number {

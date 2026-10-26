@@ -1,5 +1,5 @@
-import crypto from 'node:crypto';
-import { Bot, InlineKeyboard, Keyboard, type Context } from 'grammy';
+import fs from 'node:fs';
+import { Bot, InlineKeyboard, InputFile, Keyboard, type Context } from 'grammy';
 import { assertConfig, config } from './config';
 import { logError, logInfo, logWarn } from './logger';
 import { isAllowed } from './whitelist';
@@ -8,14 +8,26 @@ import {
   clientLabel,
   findClients,
   getClientById,
+  getOrderDetails,
   insertClient,
   insertEquipment,
   insertOrder,
+  listActiveOrders,
+  listOrderMedia,
   listRecentClients,
   migrateLegacyOrderPhotos,
+  updateOrderDiagnostics,
+  type OrderDetails,
   type Row,
 } from './db';
 import { saveBotMedia } from './media';
+import {
+  absoluteMediaPath,
+  guessMime,
+  isImageMime,
+  isInsideAllowedRoots,
+  isVideoMime,
+} from '../lib/media-store';
 import { DENY_TEXT, HELP_TEXT, fmtNameplate, hasAnyField } from './messages';
 
 interface NameplateSession {
@@ -30,15 +42,30 @@ interface NameplateSession {
 
 interface MediaSession {
   kind: 'media';
-  step: 'await_model' | 'collecting';
-  batchId: string;
-  model?: string;
+  step: 'await_order' | 'choose' | 'collecting';
+  orderId?: number;
+  orderLabel?: string;
+  clientId?: number | null;
+  equipmentId?: number | null;
+  model?: string | null;
   count: number;
 }
 
-type Session = NameplateSession | MediaSession;
+interface DiagnosticsSession {
+  kind: 'diagnostics';
+  step: 'await_text';
+  orderId: number;
+}
+
+type Session = NameplateSession | MediaSession | DiagnosticsSession;
 
 const sessions = new Map<number, Session>();
+
+// Лимиты Telegram Bot API.
+const MAX_DOWNLOAD_BYTES = 20 * 1024 * 1024; // getFile — приём файла ботом
+const MAX_PHOTO_BYTES = 10 * 1024 * 1024; // sendPhoto
+const MAX_UPLOAD_BYTES = 50 * 1024 * 1024; // sendVideo/sendDocument
+const MEDIA_PAGE_SIZE = 10;
 
 function reset(chatId: number): void {
   sessions.delete(chatId);
@@ -55,10 +82,16 @@ function emptyNameplate(): Nameplate {
 }
 
 // Постоянное меню снизу: две кнопки вместо команд-ссылок.
+const MEDIA_BUTTON = '🖼 Медиафайлы заявки';
+const ACTIVE_ORDERS_BUTTON = '📋 Актуальные заявки';
+const MEDIA_BUTTON_LEGACY = '📎 Сохранить фотографию';
+
 function menuKeyboard(): Keyboard {
   return new Keyboard()
     .text('📷 Фото шильдика')
-    .text('📎 Сохранить фотографию')
+    .text(MEDIA_BUTTON)
+    .row()
+    .text(ACTIVE_ORDERS_BUTTON)
     .resized();
 }
 
@@ -100,6 +133,178 @@ async function fetchTelegramFile(ctx: Context, fileId: string): Promise<Buffer> 
   const res = await fetch(url);
   if (!res.ok) throw new Error(`Не удалось скачать файл: HTTP ${res.status}`);
   return Buffer.from(await res.arrayBuffer());
+}
+
+function fmtBytes(bytes: number | null | undefined): string {
+  const n = Number(bytes ?? 0);
+  if (!Number.isFinite(n) || n <= 0) return '—';
+  if (n < 1024) return `${n} Б`;
+  if (n < 1024 * 1024) return `${(n / 1024).toFixed(1)} КБ`;
+  return `${(n / (1024 * 1024)).toFixed(1)} МБ`;
+}
+
+function fmtDate(value: string | null | undefined): string {
+  if (!value) return '—';
+  const d = new Date(value);
+  if (Number.isNaN(d.getTime())) return value.slice(0, 16).replace('T', ' ');
+  const pad = (x: number) => String(x).padStart(2, '0');
+  return `${pad(d.getDate())}.${pad(d.getMonth() + 1)}.${d.getFullYear()} ${pad(d.getHours())}:${pad(d.getMinutes())}`;
+}
+
+/** «958», «#958», «заявка 958», «заявка №958» → 958. */
+function parseOrderNumber(text: string): number | null {
+  const match = /^(?:заявка\s*)?[№#]?\s*(\d{1,9})$/i.exec(text.trim());
+  if (!match) return null;
+  const n = Number(match[1]);
+  return Number.isSafeInteger(n) && n > 0 ? n : null;
+}
+
+function equipmentLabel(details: OrderDetails): string {
+  const label = [details.manufacturer, details.model]
+    .map((v) => (v ?? '').trim())
+    .filter(Boolean)
+    .join(' ');
+  return label || 'оборудование без названия';
+}
+
+function orderCardText(details: OrderDetails, mediaCount: number): string {
+  const lines = [
+    `🗂 Заявка #${details.order_id} · ${equipmentLabel(details)}`,
+  ];
+  if (details.serial_number) lines.push(`🔢 Серийный номер: ${details.serial_number}`);
+  if (details.client_name) {
+    const phone = details.client_number ? ` · ${details.client_number}` : '';
+    lines.push(`👤 Клиент: ${details.client_name}${phone}`);
+  }
+  if (details.status) lines.push(`📌 Статус: ${details.status}`);
+  if (details.creation_date) lines.push(`📅 Создана: ${fmtDay(details.creation_date)}`);
+  lines.push(`📎 Медиафайлов: ${mediaCount}`);
+  return lines.join('\n');
+}
+
+function orderMediaKeyboard(orderId: number, mediaCount: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text(`🖼 Показать медиафайлы (${mediaCount})`, `mo:show:${orderId}:0`)
+    .row()
+    .text('⬆️ Загрузить медиафайлы', `mo:up:${orderId}`)
+    .row()
+    .text('✖ Отмена', 'mo:no');
+}
+
+function fmtDay(value: string | null | undefined): string {
+  if (!value) return '—';
+  const m = /^(\d{4})-(\d{2})-(\d{2})/.exec(value);
+  return m ? `${m[3]}.${m[2]}.${m[1]}` : value;
+}
+
+function truncateText(text: string, max: number): string {
+  const s = text.trim();
+  return s.length <= max ? s : `${s.slice(0, max - 1).trimEnd()}…`;
+}
+
+/** Убираем легаси-строки «Фото шильдика: путь» из комментария заявки. */
+function cleanComment(raw: string | null | undefined): string {
+  if (!raw) return '';
+  return raw
+    .split(/\r?\n/)
+    .map((line) => line.trim())
+    .filter((line) => line && !/^фото шильдика\s*:/i.test(line))
+    .join('\n')
+    .trim();
+}
+
+function activeOrderText(order: OrderDetails): string {
+  const lines = [`🗂 Заявка #${order.order_id} · ${order.status?.trim() || 'без статуса'}`];
+  lines.push(`📅 ${fmtDay(order.creation_date)}`);
+
+  const client = (order.client_name ?? '').trim() || '—';
+  const phone = (order.client_number ?? '').trim();
+  lines.push(`👤 ${client}${phone ? ` · ${phone}` : ''}`);
+
+  const serial = (order.serial_number ?? '').trim();
+  lines.push(`🔧 ${equipmentLabel(order)}${serial ? ` · S/N ${serial}` : ''}`);
+
+  const comment = truncateText(cleanComment(order.comments), 500);
+  if (comment) lines.push(`💬 Комментарий: ${comment}`);
+
+  const diagnostics = truncateText(order.diagnostic_results ?? '', 1000);
+  if (diagnostics) lines.push(`🩺 Диагностика: ${diagnostics}`);
+
+  const price = order.price == null ? '' : String(order.price).trim();
+  if (price) lines.push(`💰 Цена: ${price}`);
+
+  return lines.join('\n');
+}
+
+function activeOrderKeyboard(orderId: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('🖼 Медиафайлы', `mo:show:${orderId}:0`)
+    .text('🩺 Результат диагностики', `ao:diag:${orderId}`);
+}
+
+async function startActiveOrders(ctx: Context, chatId: number): Promise<void> {
+  reset(chatId);
+  const orders = listActiveOrders();
+  if (orders.length === 0) {
+    await ctx.reply('Актуальных заявок нет — все закрыты.', { reply_markup: menuKeyboard() });
+    return;
+  }
+  await ctx.reply(`📋 Актуальные заявки: ${orders.length}`, { reply_markup: menuKeyboard() });
+  for (let i = 0; i < orders.length; i += 1) {
+    const order = orders[i];
+    await ctx
+      .reply(activeOrderText(order), { reply_markup: activeOrderKeyboard(order.order_id) })
+      .catch((e) => logError('Ошибка отправки заявки', { orderId: order.order_id, error: String(e) }));
+    if (i + 1 < orders.length) await sleep(120);
+  }
+  logInfo(`Показаны актуальные заявки chat_id=${chatId}`, { count: orders.length });
+}
+
+async function showOrPromptDiagnostics(ctx: Context, chatId: number, orderId: number): Promise<void> {
+  const details = getOrderDetails(orderId);
+  if (!details) {
+    await ctx.reply(`Заявка #${orderId} не найдена — возможно, её удалили.`);
+    return;
+  }
+  const diagnostics = (details.diagnostic_results ?? '').trim();
+  if (diagnostics) {
+    await ctx.reply(
+      `🩺 Результат диагностики · заявка #${orderId}\n\n${truncateText(diagnostics, 3500)}`,
+      { reply_markup: menuKeyboard() }
+    );
+    return;
+  }
+  sessions.set(chatId, { kind: 'diagnostics', step: 'await_text', orderId });
+  await ctx.reply(
+    `🩺 У заявки #${orderId} результат диагностики пока не заполнен.\n` +
+      'Введите текст результата (или /cancel).',
+    { reply_markup: menuKeyboard() }
+  );
+}
+
+function mediaRoleLabel(role: string | null): string {
+  const map: Record<string, string> = {
+    nameplate: 'шильдик',
+    media: 'медиа',
+    photo: 'фото',
+    video: 'видео',
+  };
+  return role ? map[role] ?? role : 'медиа';
+}
+
+/** Файл существует и лежит внутри разрешённых корней. */
+function existingMediaPath(relPath: string): string | null {
+  const abs = absoluteMediaPath(relPath);
+  if (!isInsideAllowedRoots(abs) || !fs.existsSync(abs)) return null;
+  return abs;
+}
+
+function tooBigNotice(size: number | null | undefined): string {
+  return `⚠️ Файл ${fmtBytes(size)} — больше 20 МБ. Бот не может его скачать, загрузите через веб-консоль.`;
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
 function summaryText(session: NameplateSession, isNew: boolean): string {
@@ -201,16 +406,199 @@ async function recognizeNameplate(
   }
 }
 
-// ---------- Сценарий 2: модель + пачка медиафайлов ----------
+// ---------- Сценарий 2: медиафайлы заявки ----------
 
 async function startMedia(ctx: Context, chatId: number): Promise<void> {
+  sessions.set(chatId, { kind: 'media', step: 'await_order', count: 0 });
+  await ctx.reply('🖼 Введите номер заявки (например, 958). /cancel — отмена.', {
+    reply_markup: menuKeyboard(),
+  });
+}
+
+async function handleOrderNumber(
+  ctx: Context,
+  chatId: number,
+  session: MediaSession,
+  text: string
+): Promise<void> {
+  const orderId = parseOrderNumber(text);
+  if (orderId == null) {
+    await ctx.reply('Не понял номер. Введите число, например 958 (или /cancel).');
+    return;
+  }
+  const details = getOrderDetails(orderId);
+  if (!details) {
+    await ctx.reply(`Заявка #${orderId} не найдена. Проверьте номер (или /cancel).`);
+    return;
+  }
+  const mediaCount = listOrderMedia(orderId).length;
+  session.orderId = details.order_id;
+  session.orderLabel = equipmentLabel(details);
+  session.clientId = details.client_id;
+  session.equipmentId = details.equipment_id;
+  session.model = details.model;
+  session.step = 'choose';
+  await ctx.reply(`${orderCardText(details, mediaCount)}\n\nЧто сделать?`, {
+    reply_markup: orderMediaKeyboard(details.order_id, mediaCount),
+  });
+}
+
+async function startOrderUpload(ctx: Context, chatId: number, orderId: number): Promise<void> {
+  const details = getOrderDetails(orderId);
+  if (!details) {
+    await ctx.reply(`Заявка #${orderId} не найдена — возможно, её удалили.`);
+    reset(chatId);
+    return;
+  }
   sessions.set(chatId, {
     kind: 'media',
-    step: 'await_model',
-    batchId: crypto.randomUUID(),
+    step: 'collecting',
+    orderId: details.order_id,
+    orderLabel: equipmentLabel(details),
+    clientId: details.client_id,
+    equipmentId: details.equipment_id,
+    model: details.model,
     count: 0,
   });
-  await ctx.reply('📎 Отправьте модель насоса (текстом).');
+  await ctx.reply(
+    `⬆️ Заявка #${details.order_id} · ${equipmentLabel(details)}\n` +
+      'Присылайте фото или видео. /finish — закончить.',
+    { reply_markup: menuKeyboard() }
+  );
+}
+
+function uploadOnlyKeyboard(orderId: number): InlineKeyboard {
+  return new InlineKeyboard()
+    .text('⬆️ Загрузить медиафайлы', `mo:up:${orderId}`)
+    .row()
+    .text('✖ Отмена', 'mo:no');
+}
+
+function showPageKeyboard(orderId: number, page: number, totalPages: number): InlineKeyboard {
+  const kb = new InlineKeyboard();
+  if (page > 0) kb.text('⬅️ Назад', `mo:show:${orderId}:${page - 1}`);
+  if (page + 1 < totalPages) kb.text(`Показать ещё ${MEDIA_PAGE_SIZE}`, `mo:show:${orderId}:${page + 1}`);
+  if (page > 0 || page + 1 < totalPages) kb.row();
+  kb.text('⬆️ Загрузить медиафайлы', `mo:up:${orderId}`).row();
+  kb.text('✖ Отмена', 'mo:no');
+  return kb;
+}
+
+async function sendOrderMediaFile(
+  ctx: Context,
+  media: { file_path: string; mime_type: string | null; role: string | null; step_no: number | null; caption: string | null; created_at: string | null },
+  index: number,
+  total: number
+): Promise<void> {
+  const abs = existingMediaPath(media.file_path);
+  if (!abs) {
+    await ctx.reply(`⚠️ Файл ${index}/${total} не найден на диске.`).catch(() => {});
+    return;
+  }
+  let size = 0;
+  try {
+    size = fs.statSync(abs).size;
+  } catch {
+    await ctx.reply(`⚠️ Файл ${index}/${total} недоступен.`).catch(() => {});
+    return;
+  }
+  const mime = media.mime_type || guessMime(abs);
+  const lines = [
+    `#${media.step_no ?? index} · ${mediaRoleLabel(media.role)} · ${fmtDate(media.created_at)} · ${fmtBytes(size)}`,
+  ];
+  if (media.caption) lines.push(media.caption);
+  lines.push(`Файл ${index} из ${total}`);
+  const caption = lines.join('\n').slice(0, 1024);
+
+  try {
+    if (isVideoMime(mime)) {
+      if (size > MAX_UPLOAD_BYTES) {
+        await ctx.reply(
+          `🎬 Видео ${index}/${total} (${fmtBytes(size)}) больше 50 МБ — Telegram не даст боту его отправить. Откройте в веб-консоли.`
+        );
+        return;
+      }
+      await ctx.replyWithVideo(new InputFile(abs), { caption, supports_streaming: true });
+      return;
+    }
+    if (isImageMime(mime)) {
+      if (size <= MAX_PHOTO_BYTES) {
+        await ctx.replyWithPhoto(new InputFile(abs), { caption });
+        return;
+      }
+      if (size <= MAX_UPLOAD_BYTES) {
+        await ctx.replyWithDocument(new InputFile(abs), { caption });
+        return;
+      }
+      await ctx.reply(
+        `🖼 Файл ${index}/${total} (${fmtBytes(size)}) больше 50 МБ — откройте в веб-консоли.`
+      );
+      return;
+    }
+    if (size <= MAX_UPLOAD_BYTES) {
+      await ctx.replyWithDocument(new InputFile(abs), { caption });
+      return;
+    }
+    await ctx.reply(`📄 Файл ${index}/${total} (${fmtBytes(size)}) больше 50 МБ — откройте в веб-консоли.`);
+  } catch (e) {
+    logError(`Ошибка отправки медиа ${media.file_path}`, { error: String(e) });
+    await ctx.reply(`⚠️ Не удалось отправить файл ${index}/${total}.`).catch(() => {});
+  }
+}
+
+async function showOrderMedia(
+  ctx: Context,
+  chatId: number,
+  orderId: number,
+  page: number
+): Promise<void> {
+  const details = getOrderDetails(orderId);
+  if (!details) {
+    await ctx.reply(`Заявка #${orderId} не найдена — возможно, её удалили.`);
+    return;
+  }
+  const rows = listOrderMedia(orderId);
+  if (rows.length === 0) {
+    await ctx.reply(
+      `${orderCardText(details, 0)}\n\nУ этой заявки пока нет медиафайлов.`,
+      { reply_markup: uploadOnlyKeyboard(orderId) }
+    );
+    return;
+  }
+  const available = rows.filter((row) => existingMediaPath(row.file_path) !== null);
+  const missing = rows.length - available.length;
+  if (available.length === 0) {
+    await ctx.reply(
+      `${orderCardText(details, rows.length)}\n\n⚠️ Записи есть, но файлы не найдены на диске (${missing}).`,
+      { reply_markup: uploadOnlyKeyboard(orderId) }
+    );
+    return;
+  }
+  const totalPages = Math.ceil(available.length / MEDIA_PAGE_SIZE);
+  const current = Math.min(Math.max(0, Math.floor(page)), totalPages - 1);
+  const slice = available.slice(current * MEDIA_PAGE_SIZE, (current + 1) * MEDIA_PAGE_SIZE);
+  const from = current * MEDIA_PAGE_SIZE + 1;
+  const to = from + slice.length - 1;
+
+  const header = [
+    orderCardText(details, rows.length),
+    `\nПоказываю файлы ${from}–${to} из ${available.length}.`,
+  ];
+  if (missing > 0) header.push(`⚠️ Недоступно на диске: ${missing}.`);
+
+  await ctx.reply(header.join('\n'), {
+    reply_markup: showPageKeyboard(orderId, current, totalPages),
+  });
+  for (let i = 0; i < slice.length; i += 1) {
+    await sendOrderMediaFile(ctx, slice[i], from + i, available.length);
+    if (i + 1 < slice.length) await sleep(150);
+  }
+  logInfo(`Показаны медиа заявки chat_id=${chatId}`, {
+    orderId,
+    page: current + 1,
+    totalPages,
+    sent: slice.length,
+  });
 }
 
 interface CollectedMedia {
@@ -224,20 +612,34 @@ interface CollectedMedia {
   duration?: number | null;
 }
 
-async function collectMedia(
+async function collectOrderMedia(
   ctx: Context,
   chatId: number,
   session: MediaSession,
   media: CollectedMedia
 ): Promise<void> {
+  if (session.orderId == null) {
+    await ctx.reply('Сначала укажите номер заявки.');
+    return;
+  }
+  const details = getOrderDetails(session.orderId);
+  if (!details) {
+    reset(chatId);
+    await ctx.reply(`Заявка #${session.orderId} больше не существует. Начните заново.`, {
+      reply_markup: menuKeyboard(),
+    });
+    return;
+  }
   try {
     saveBotMedia({
       buffer: media.buffer,
       mime: media.mime,
       originalName: media.originalName,
       thumbBuffer: media.thumbBuffer,
-      model: session.model ?? null,
-      batchId: session.batchId,
+      orderId: details.order_id,
+      equipmentId: details.equipment_id,
+      clientId: details.client_id,
+      model: details.model,
       role: 'media',
       caption: media.caption ?? null,
       width: media.width ?? null,
@@ -245,8 +647,14 @@ async function collectMedia(
       duration: media.duration ?? null,
     });
     session.count += 1;
-    const name = session.model ? `«${session.model}»` : '';
-    await ctx.reply(`✅ Принято ${name}, файл ${session.count}. Ещё? /finish — закончить.`);
+    session.equipmentId = details.equipment_id;
+    session.clientId = details.client_id;
+    session.model = details.model;
+    const total = listOrderMedia(details.order_id).length;
+    await ctx.reply(
+      `✅ Заявка #${details.order_id}: файл ${session.count} сохранён (${fmtBytes(media.buffer.length)}).` +
+        `\nВсего у заявки: ${total}. Ещё? /finish — закончить.`
+    );
   } catch (e) {
     logError(`Ошибка сохранения медиа chat_id=${chatId}`, { error: String(e) });
     await ctx.reply('⚠️ Не удалось сохранить файл. Попробуйте ещё раз.');
@@ -258,20 +666,34 @@ async function collectMedia(
 async function onPhoto(
   ctx: Context,
   chatId: number,
-  photos: { file_id: string; file_unique_id: string }[]
+  photos: { file_id: string; file_unique_id: string; file_size?: number }[]
 ): Promise<void> {
   const session = sessions.get(chatId);
   if (!session) {
     await ctx.reply('Выберите действие кнопкой внизу.', { reply_markup: menuKeyboard() });
     return;
   }
+  if (session.kind === 'diagnostics') {
+    await ctx.reply('Введите результат диагностики текстом (или /cancel).');
+    return;
+  }
   if (session.kind === 'media') {
-    if (session.step !== 'collecting') {
-      await ctx.reply('Сначала пришлите модель насоса текстом.');
+    if (session.step === 'await_order') {
+      await ctx.reply('Сначала введите номер заявки (например, 958). /cancel — отмена.');
+      return;
+    }
+    if (session.step === 'choose') {
+      await ctx.reply('Выберите «⬆️ Загрузить медиафайлы» кнопкой выше.', {
+        reply_markup: menuKeyboard(),
+      });
       return;
     }
     const largest = photos[photos.length - 1];
     const smallest = photos[0];
+    if ((largest.file_size ?? 0) > MAX_DOWNLOAD_BYTES) {
+      await ctx.reply(tooBigNotice(largest.file_size));
+      return;
+    }
     try {
       const buffer = await fetchTelegramFile(ctx, largest.file_id);
       let thumbBuffer: Buffer | null = null;
@@ -282,7 +704,7 @@ async function onPhoto(
           thumbBuffer = null;
         }
       }
-      await collectMedia(ctx, chatId, session, {
+      await collectOrderMedia(ctx, chatId, session, {
         buffer,
         mime: 'image/jpeg',
         thumbBuffer,
@@ -310,6 +732,7 @@ async function onVideo(
     file_id: string;
     mime_type?: string;
     file_name?: string;
+    file_size?: number;
     width?: number;
     height?: number;
     duration?: number;
@@ -317,10 +740,18 @@ async function onVideo(
   }
 ): Promise<void> {
   const session = sessions.get(chatId);
+  if (session?.kind === 'diagnostics') {
+    await ctx.reply('Введите результат диагностики текстом (или /cancel).');
+    return;
+  }
   if (!session || session.kind !== 'media' || session.step !== 'collecting') {
-    await ctx.reply('Видео можно приложить по кнопке «📎 Сохранить фотографию».', {
+    await ctx.reply('Видео можно приложить по кнопке «🖼 Медиафайлы заявки».', {
       reply_markup: menuKeyboard(),
     });
+    return;
+  }
+  if ((video.file_size ?? 0) > MAX_DOWNLOAD_BYTES) {
+    await ctx.reply(tooBigNotice(video.file_size));
     return;
   }
   try {
@@ -333,7 +764,7 @@ async function onVideo(
         thumbBuffer = null;
       }
     }
-    await collectMedia(ctx, chatId, session, {
+    await collectOrderMedia(ctx, chatId, session, {
       buffer,
       mime: video.mime_type || 'video/mp4',
       thumbBuffer,
@@ -351,6 +782,55 @@ async function onVideo(
   }
 }
 
+async function onImageDocument(
+  ctx: Context,
+  chatId: number,
+  doc: {
+    file_id: string;
+    mime_type?: string;
+    file_name?: string;
+    file_size?: number;
+    thumbnail?: { file_id: string };
+  }
+): Promise<void> {
+  const session = sessions.get(chatId);
+  if (session?.kind === 'diagnostics') {
+    await ctx.reply('Введите результат диагностики текстом (или /cancel).');
+    return;
+  }
+  if (!session || session.kind !== 'media' || session.step !== 'collecting') {
+    await ctx.reply('Фото пришлите как изображение или откройте «🖼 Медиафайлы заявки».', {
+      reply_markup: menuKeyboard(),
+    });
+    return;
+  }
+  if ((doc.file_size ?? 0) > MAX_DOWNLOAD_BYTES) {
+    await ctx.reply(tooBigNotice(doc.file_size));
+    return;
+  }
+  try {
+    const buffer = await fetchTelegramFile(ctx, doc.file_id);
+    let thumbBuffer: Buffer | null = null;
+    if (doc.thumbnail) {
+      try {
+        thumbBuffer = await fetchTelegramFile(ctx, doc.thumbnail.file_id);
+      } catch {
+        thumbBuffer = null;
+      }
+    }
+    await collectOrderMedia(ctx, chatId, session, {
+      buffer,
+      mime: doc.mime_type || 'image/jpeg',
+      thumbBuffer,
+      originalName: doc.file_name,
+      caption: ctx.message?.caption ?? null,
+    });
+  } catch (e) {
+    logError(`Ошибка скачивания фото-документа chat_id=${chatId}`, { error: String(e) });
+    await ctx.reply('⚠️ Не удалось получить файл из Telegram. Отправьте ещё раз.');
+  }
+}
+
 async function onText(ctx: Context, chatId: number, text: string): Promise<void> {
   const session = sessions.get(chatId);
   if (!session) {
@@ -358,16 +838,41 @@ async function onText(ctx: Context, chatId: number, text: string): Promise<void>
     return;
   }
   if (session.kind === 'media') {
-    if (session.step === 'await_model') {
-      session.model = text;
-      session.step = 'collecting';
-      await ctx.reply(
-        `Модель «${text}» записана. Отправьте пачку медиафайлов. /finish — закончить.`,
-        { reply_markup: menuKeyboard() }
-      );
+    if (session.step === 'await_order') {
+      await handleOrderNumber(ctx, chatId, session, text);
       return;
     }
-    await ctx.reply('Пришлите фото или видео, либо /finish.');
+    if (session.step === 'choose') {
+      if (parseOrderNumber(text) != null) {
+        await handleOrderNumber(ctx, chatId, session, text);
+        return;
+      }
+      await ctx.reply('Выберите действие кнопкой: «🖼 Показать медиафайлы» или «⬆️ Загрузить медиафайлы».');
+      return;
+    }
+    await ctx.reply('Пришлите фото или видео, либо /finish — закончить.');
+    return;
+  }
+  if (session.kind === 'diagnostics') {
+    const diagnostics = text.trim();
+    if (!diagnostics) {
+      await ctx.reply('Введите результат диагностики текстом (или /cancel).');
+      return;
+    }
+    const orderId = session.orderId;
+    const saved = updateOrderDiagnostics(orderId, diagnostics);
+    reset(chatId);
+    if (!saved) {
+      await ctx.reply(`Заявка #${orderId} не найдена — результат не сохранён.`, {
+        reply_markup: menuKeyboard(),
+      });
+      return;
+    }
+    await ctx.reply(
+      `✅ Результат диагностики сохранён в заявку #${orderId}.\n\n🩺 ${truncateText(diagnostics, 3500)}`,
+      { reply_markup: menuKeyboard() }
+    );
+    logInfo(`Результат диагностики сохранён chat_id=${chatId}`, { orderId });
     return;
   }
 
@@ -473,7 +978,7 @@ async function main(): Promise<void> {
     if (chatId === undefined || !isAllowed(chatId)) return deny(ctx);
     reset(chatId);
     await ctx.reply(
-      'Привет! Выберите действие кнопкой внизу.\n\n📷 Фото шильдика — распознать и создать заявку.\n📎 Сохранить фотографию — записать модель насоса и пачку медиафайлов.',
+      'Привет! Выберите действие кнопкой внизу.\n\n📷 Фото шильдика — распознать и создать заявку.\n🖼 Медиафайлы заявки — посмотреть или загрузить фото/видео по номеру заявки.\n📋 Актуальные заявки — все незакрытые заявки с контактами и диагностикой.',
       { reply_markup: menuKeyboard() }
     );
   });
@@ -501,15 +1006,15 @@ async function main(): Promise<void> {
     const chatId = ctx.chat?.id;
     if (chatId === undefined || !isAllowed(chatId)) return deny(ctx);
     const session = sessions.get(chatId);
-    if (session && session.kind === 'media') {
+    if (session && session.kind === 'media' && session.step === 'collecting') {
       const info =
         session.count > 0
-          ? `Сохранено файлов: ${session.count} (модель «${session.model ?? '—'}»).`
+          ? `В заявку #${session.orderId} сохранено файлов: ${session.count}.`
           : 'Файлы не отправлялись.';
       reset(chatId);
       await ctx.reply(`✅ Готово. ${info}`, { reply_markup: menuKeyboard() });
     } else {
-      await ctx.reply('Нет активного прикрепления.', { reply_markup: menuKeyboard() });
+      await ctx.reply('Нет активной загрузки медиафайлов.', { reply_markup: menuKeyboard() });
     }
   });
 
@@ -602,6 +1107,58 @@ async function main(): Promise<void> {
     await ctx.reply('Готово.', { reply_markup: menuKeyboard() });
   });
 
+  // --- Медиафайлы заявки ---
+  bot.callbackQuery(/^mo:show:(\d+):(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    if (!isAllowed(chatId)) return deny(ctx);
+    const orderId = Number(ctx.match[1]);
+    const page = Number(ctx.match[2]);
+    await ctx.answerCallbackQuery();
+    reset(chatId);
+    try {
+      await showOrderMedia(ctx, chatId, orderId, page);
+    } catch (e) {
+      logError(`Ошибка показа медиа заявки chat_id=${chatId}`, { orderId, error: String(e) });
+      await ctx.reply('⚠️ Не удалось показать медиафайлы. Попробуйте ещё раз.');
+    }
+  });
+
+  bot.callbackQuery(/^mo:up:(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    if (!isAllowed(chatId)) return deny(ctx);
+    const orderId = Number(ctx.match[1]);
+    await ctx.answerCallbackQuery();
+    await startOrderUpload(ctx, chatId, orderId);
+  });
+
+  bot.callbackQuery('mo:no', async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    if (!isAllowed(chatId)) return deny(ctx);
+    reset(chatId);
+    await ctx.answerCallbackQuery();
+    await ctx.editMessageText('✖ Отменено. Выберите действие кнопкой внизу.').catch(() => {});
+    await ctx.reply('Готово.', { reply_markup: menuKeyboard() });
+  });
+
+  // --- Результат диагностики из списка актуальных заявок ---
+  bot.callbackQuery(/^ao:diag:(\d+)$/, async (ctx) => {
+    const chatId = ctx.chat?.id;
+    if (chatId === undefined) return;
+    if (!isAllowed(chatId)) return deny(ctx);
+    const orderId = Number(ctx.match[1]);
+    await ctx.answerCallbackQuery();
+    reset(chatId);
+    try {
+      await showOrPromptDiagnostics(ctx, chatId, orderId);
+    } catch (e) {
+      logError(`Ошибка диагностики chat_id=${chatId}`, { orderId, error: String(e) });
+      await ctx.reply('⚠️ Не удалось получить результат диагностики. Попробуйте ещё раз.');
+    }
+  });
+
   // --- Обычные сообщения: текстовые кнопки, фото, видео, текст ---
   bot.on('message', async (ctx) => {
     const chatId = ctx.chat?.id;
@@ -612,7 +1169,8 @@ async function main(): Promise<void> {
     if (typeof msg.text === 'string') {
       const text = msg.text.trim();
       if (text === '📷 Фото шильдика') return startNameplate(ctx, chatId);
-      if (text === '📎 Сохранить фотографию') return startMedia(ctx, chatId);
+      if (text === MEDIA_BUTTON || text === MEDIA_BUTTON_LEGACY) return startMedia(ctx, chatId);
+      if (text === ACTIVE_ORDERS_BUTTON) return startActiveOrders(ctx, chatId);
       if (text.startsWith('/')) return; // неизвестная команда
       return onText(ctx, chatId, text);
     }
@@ -628,6 +1186,16 @@ async function main(): Promise<void> {
         file_id: msg.document.file_id,
         mime_type: msg.document.mime_type,
         file_name: msg.document.file_name,
+        file_size: msg.document.file_size,
+        thumbnail: msg.document.thumbnail,
+      });
+    }
+    if (msg.document && (msg.document.mime_type ?? '').startsWith('image/')) {
+      return onImageDocument(ctx, chatId, {
+        file_id: msg.document.file_id,
+        mime_type: msg.document.mime_type,
+        file_name: msg.document.file_name,
+        file_size: msg.document.file_size,
         thumbnail: msg.document.thumbnail,
       });
     }
